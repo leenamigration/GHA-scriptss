@@ -1,0 +1,165 @@
+name: DSM Services CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  DockerPush: 'false'
+  REDIS_CONTAINER_NAME: escrowgateway-db
+  SkipDockerTestparsing: 'False'
+  OSSPI_BID: '10110'
+  OSSPI_PRODUCT_VERSION: main
+  OSSPI_RID: '000'
+  runSonar: 'true'
+
+jobs:
+  update-build-status:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Update build status on GitHub
+      run: |
+        curl -v POST "${{ secrets.GITHUB_WEBHOOK_URL }}" \
+        --header 'Accept: application/vnd.github+json' \
+        --header 'x-github-token: ${{ secrets.GITHUB_TOKEN }}' \
+        --header 'Content-Type: application/json' \
+        --data '{
+          "event_type": "build_status",
+          "client_payload": {
+            "build_result_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "context": "${{ github.workflow }}",
+            "commit_id": "${{ github.sha }}",
+            "build_status": "InProgress",
+            "build_plan_key": "${{ github.run_id }}",
+            "build_number": "${{ github.run_number }}",
+            "git_url": "${{ github.repository }}"
+          }
+        }'
+
+  build-database:
+    runs-on: windows-latest
+    needs: update-build-status
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Inject environment variables
+      run: |
+        echo "ASPNETCORE_ENVIRONMENT=Production" >> $GITHUB_ENV
+
+    - name: Build SQL Project
+      uses: microsoft/setup-msbuild@v1
+      with:
+        msbuild-version: '17.0.0'
+        
+    - name: Build database
+      run: msbuild VMware.UEM.DesiredStateManagement.Database.sln /p:Configuration=Release
+
+    - name: Upload Dacpac Artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: dacpac
+        path: src/VMware.UEM.DesiredStateManagement.Database/bin/Release/**/*.dacpac
+
+  build-api:
+    runs-on: ubuntu-latest
+    needs: build-database
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Inject environment variables
+      run: |
+        echo "ASPNETCORE_ENVIRONMENT=Production" >> $GITHUB_ENV
+
+    - name: Make .sh files executable
+      run: ./bamboo-specs/scripts/common/set_permission.sh
+
+    - name: LFS Pull
+      run: ./bamboo-specs/scripts/common/lfs_pull.sh
+
+    - name: Download Dacpac Artifact
+      uses: actions/download-artifact@v2
+      with:
+        name: dacpac
+        path: src/VMware.UEM.DesiredStateManagement.Database/
+
+    - name: Run Cake Build
+      run: ./build.sh --runSonar=true --pushArtifact=true
+
+    - name: Parse Test Results
+      uses: actions/upload-artifact@v2
+      with:
+        name: build-output
+        path: ./artifacts/**/*
+
+    - name: Upload Dacpac Artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: dsm-final-dacpac
+        path: '**/*.dacpac'
+
+  build-publish-docker:
+    runs-on: ubuntu-latest
+    needs: build-api
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Inject environment variables
+      run: |
+        echo "ASPNETCORE_ENVIRONMENT=Production" >> $GITHUB_ENV
+
+    - name: Make .sh files executable
+      run: ./bamboo-specs/scripts/common/set_permission.sh
+
+    - name: LFS Pull
+      run: ./bamboo-specs/scripts/common/lfs_pull.sh
+
+    - name: Download Dacpac Artifact
+      uses: actions/download-artifact@v2
+      with:
+        name: dacpac
+        path: src/VMware.UEM.DesiredStateManagement.Database/
+
+    - name: Docker Build and Push
+      run: ./build.sh --target=DockerDefault --publishDockerImage=true
+
+    - name: Create Services Artifact
+      run: ./bamboo-specs/scripts/common/create_services_artifact.sh
+
+    - name: Docker Cleanup
+      run: ./bamboo-specs/scripts/common/docker_clean_rm.sh
+
+    - name: MSTest Parser
+      uses: actions/upload-artifact@v2
+      with:
+        name: mstest-results
+        path: '**/container-test-results/*.trx'
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v2
+      with:
+        name: artifacts
+        path: ./artifacts/**/*
+
+    - name: Upload Services Artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: services-artifact
+        path: '**/services-artifact.zip'
+
+notifications:
+  pull_request:
+    types: [completed]
+  webhook:
+    url: http://bbs2gh.ssdevrd.com:3000/webhook
+  webhook:
+    url: http://ws1-build-36-61.vmware.com:8080/api/v1/dags/post_build_dag_example/dagRuns

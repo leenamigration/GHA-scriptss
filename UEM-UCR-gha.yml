@@ -1,0 +1,251 @@
+name: UEM Console Replication CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  osspi_bid: '2283'
+  osspi_product_version: master
+  osspi_rid: '000'
+  project_slug: UEM
+  repository_slug: uem-console-replication-service
+
+jobs:
+  update-build-status:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Update build status on GitHub
+      run: |
+        echo "***************"
+        curl -v POST "${{ secrets.GITHUB_WEBHOOK_URL }}" \
+        --header 'Accept: application/vnd.github+json' \
+        --header 'x-github-token: ${{ secrets.GITHUB_TOKEN }}' \
+        --header 'Content-Type: application/json' \
+        --data '{
+          "event_type": "build_status",
+          "client_payload": {
+            "build_result_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "context": "${{ github.workflow }}",
+            "commit_id": "${{ github.sha }}",
+            "build_status": "InProgress",
+            "build_plan_key": "${{ github.run_id }}",
+            "build_number": "${{ github.run_number }}",
+            "git_url": "${{ github.repository }}"
+          }
+        }'
+
+  build-test-sonar:
+    runs-on: ubuntu-latest
+    needs: update-build-status
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Build Code, Run Tests, and Publish Sonar Coverage
+      run: |
+        rm -rf assets && git lfs install && git lfs pull
+        export TEST_AGAINST_REMOTE=false
+        sh build.sh --target=Default --runSonar=true --should_publish_package=true --verbosity=diagnostic --runtime win-x64
+      env:
+        JAVA_HOME: /usr/lib/jvm/adoptopenjdk-11-hotspot
+
+    - name: Copy Artifacts at Root
+      run: |
+        if [ -f './build/artifacts/artifact_info.json' ]; then
+          echo "artifact json is available."
+          cp -rv ./build/artifacts/artifact_info.json .
+        else
+          echo "artifact json does not exist."
+        fi
+
+    - name: Create Services Artifact
+      run: |
+        zip -r services-artifact.zip services/
+
+    - name: Upload Log Files
+      uses: actions/upload-artifact@v2
+      with:
+        name: log-files
+        path: '**/*.log'
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v2
+      with:
+        name: build-artifacts
+        path: build/artifacts/**/*.zip
+
+    - name: Upload Artifact Info
+      uses: actions/upload-artifact@v2
+      with:
+        name: artifacts-temp
+        path: '**/artifact_info.json'
+
+    - name: Upload Services Artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: services-artifact
+        path: '**/services-artifact.zip'
+
+    - name: Upload Coverage
+      uses: actions/upload-artifact@v2
+      with:
+        name: coverage
+        path: '**/VMware.UEM.ConsoleReplication.xml'
+
+  download-extract-dacpac:
+    runs-on: windows-latest
+    steps:
+    - name: Clean Directory
+      run: |
+        Remove-Item -Recurse -Force *
+
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Download Artifacts
+      run: |
+        .\test\DatabaseSetup\DownloadInstaller.ps1 -user ${{ secrets.AW_ARTIFACTORY_API_USERNAME }} -apiKey ${{ secrets.AW_ARTIFACTORY_API_KEY_PASSWORD }} -targetPath ${{ github.workspace }}
+
+    - name: Extract Dacpacs
+      run: |
+        .\test\DatabaseSetup\ExtractDacpacs.ps1 -exeFolder ${{ github.workspace }}
+        Get-ChildItem -Recurse $pwd | Where { ! $_.PSIsContainer } | Select Name, FullName
+
+    - name: Upload Dacpacs
+      uses: actions/upload-artifact@v2
+      with:
+        name: dacpacs
+        path: '**/*.dacpac'
+  
+  build-test-container:
+    runs-on: ubuntu-latest
+    needs: update-build-status
+    steps:
+      - name: Docker Cleanup
+        run: |
+          docker rm -f $(docker ps -a -q)
+          docker rmi -f $(docker images -a -q)
+          docker system prune --volumes -f
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Download Dacpacs
+        uses: actions/download-artifact@v2
+        with:
+          name: dacpacs
+          path: '${{ github.workspace }}'
+      - name: Build Docker Image and Run Tests against Remote Server
+        run: |
+          rm -rf assets && git lfs install && git lfs pull
+          export TEST_AGAINST_REMOTE=true && sh build.sh --target=DockerDefault
+      - name: MSTest Parser
+        uses: actions/upload-artifact@v2
+        with:
+          name: test-results
+          path: '**/container-test-results/*.trx'
+      - name: Create Services Artifact
+        run: zip -r services-artifact.zip services/
+      - name: Chown Build Directory
+        run: 'sudo chown -R $USER:$USER ${{ github.workspace }}'
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v2
+        with:
+          name: test-results
+          path: '**/artifacts/test-results/**'
+  build-publish-docker:
+    runs-on: ubuntu-latest
+    needs: build-test-container
+    steps:
+      - name: Docker Cleanup
+        run: |
+          docker rm -f $(docker ps -a -q)
+          docker rmi -f $(docker images -a -q)
+          docker system prune --volumes -f
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Download Dacpacs
+        uses: actions/download-artifact@v2
+        with:
+          name: dacpacs
+          path: '${{ github.workspace }}'
+      - name: Build and Publish Docker Artifacts
+        run: >
+          rm -rf assets && git lfs install && git lfs pull
+
+          export TEST_AGAINST_REMOTE=true && sh build.sh
+          --publishDockerImage=true --target=DockerDefault
+      - name: MSTest Parser
+        uses: actions/upload-artifact@v2
+        with:
+          name: test-results
+          path: '**/container-test-results/*.trx'
+      - name: Copy artifact_info.json from previous Job
+        run: >
+          artifact_info_json="https://bamboo.air-watch.com/browse/$GITHUB_REPOSITORY-$GITHUB_RUN_NUMBER/artifact/LBOL/artifacts-temp/artifact_info.json"
+
+          curl -D- -X GET -u ${{ secrets.BAMBOO_USERNAME }}:${{
+          secrets.BAMBOO_PASSWORD }} $artifact_info_json -o
+          "artifact_info_config_replicator.json"
+
+          jq --argjson arr "$(cat build/artifact_info.json)" '.artifacts +=
+          ($arr | map({repositories: .repositories, artifact_name: .image_name,
+          full_name_with_unique_tag: "\(.image_name):\(.unique_tag)",
+          full_name_with_stable_tag: "\(.image_name):\(.stable_tag)",
+          stable_tag: .stable_tag, staging_stable_tag: "\(.stable_tag)-staging",
+          unique_tag: .unique_tag, artifact_type: "DOCKER"}))'
+          artifact_info_config_replicator.json > ./artifact_info.json
+
+          cp build/artifact_info_tests.json .
+      - name: Chown Build Directory
+        run: 'sudo chown -R $USER:$USER ${{ github.workspace }}'
+      - name: Upload Log Files
+        uses: actions/upload-artifact@v2
+        with:
+          name: log-files
+          path: '**/*.log'
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: artifacts
+          path: '**/artifact_info*.json'
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v2
+        with:
+          name: test-results
+          path: '**/artifacts/test-results/**'
+  code-provenance:
+    runs-on: windows-latest
+    needs: build-publish-docker
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Checkout provenance repository
+        uses: actions/checkout@v2
+        with:
+          repository: your-org/SRP-Provenance-GH
+          path: srp-tools
+          fetch-depth: 0
+      - name: Run Provenance
+        run: >-
+          powershell ./build_srp_provenance.ps1 -PlanName ${{
+          github.event.head_commit.message }} -BuildKey ${{ github.run_id }}
+          -BuildNumber ${{ github.run_number }} -ClientId ${{
+          secrets.SRP_CLIENT_ID }} -ClientSecret ${{ secrets.SRP_CLIENT_SECRET
+          }} -Revision ${{ github.sha }} -BranchName ${{ github.ref_name }}
+      - name: Docker Cleanup
+        run: ./bamboo-specs/scripts/common/docker_clean_rm.sh
+
+notifications:
+  pull_request:
+    types: [completed]
+  webhook:
+    url: http://bbs2gh.ssdevrd.com:3000/webhook
+  webhook:
+    url: http://ws1-build-36-61.vmware.com:8080/api/v1/dags/post_build_dag_example/dagRuns
